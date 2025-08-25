@@ -1,6 +1,10 @@
 # src/sql/db.py
 import sqlite3, os, time
 
+# 정형 데이터(메타 데이터, 원본) 등을 저장할 테이블
+# url, title, source, date_published, date_crawled, content_hash, raw_text, lang 저장
+
+# 스키마란? 데이터베이스의 구조를 만드는 sql 명령어.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents(
   id INTEGER PRIMARY KEY AUTOINCREMENT,

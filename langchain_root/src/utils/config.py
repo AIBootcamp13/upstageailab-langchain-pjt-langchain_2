@@ -7,6 +7,8 @@ def _read_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
+# .env와 configs/*를 읽어 하나의 런타임 설정 객체로 합침
+# AppConfig 클래스 덕분에 파일들은 경로/키 걱정 없이 다음과 같이 쉽게 접근 가능
 class AppConfig:
     def __init__(self):
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))

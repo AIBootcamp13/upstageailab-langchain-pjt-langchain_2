@@ -26,4 +26,4 @@ section_based:
 
 claim_quote_based:
   enabled: false
-  # 규제/발언 기사에서 켜서 실험(추후 Day4~5)
+  # 규제/발언 기사에서 켜서 실험(추후 코드 바꾸기)
