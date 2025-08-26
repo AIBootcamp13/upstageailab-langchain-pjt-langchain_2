@@ -3,10 +3,9 @@
 from src.utils.config import AppConfig
 from src.sql.db import SqlStore
 from src.crawler.rss_crawler import fetch_rss_docs
-
-# 새로 추가된 import
 from src.llm.solar import SolarClient
 from src.vector_store.indexer import Indexer
+from src.qa.answerer import Answerer
 
 class MainApp:
     def __init__(self):
@@ -60,10 +59,53 @@ class MainApp:
         print("[INDEX RESULT]", result)
 
     # 3) 검색+생성: Top-k 검색 → LLM 답변 생성(+출처)
+        # 3) 검색+생성: Top-k 검색 → LLM 답변 생성(+출처)
     def run_qa(self, question: str):
+        """
+        질문 한 번으로:
+          - Retriever로 Top-k 근거 검색
+          - PromptBuilder로 프롬프트 조립
+          - Solar LLM(mini/pro)로 생성
+        결과를 콘솔에 보기 좋게 출력합니다.
+        """
         print(f"[QA    ] Q: {question}")
-        print("        아직 구현 전입니다. 다음 단계에서 'retriever'와 'llm(생성)'을 붙일게요.")
 
+        # 오케스트레이터 준비(Top-k/MMR은 필요 시 조정)
+        answerer = Answerer(
+            cfg=self.cfg,
+            top_k=5,
+            use_mmr=True,
+            mmr_lambda=0.3,
+        )
+
+        # 같은 컨텍스트로 두 모델 결과를 나란히 비교
+        results = answerer.answer_multi(
+            question=question,
+            models=["solar-pro", "solar-mini"],
+            max_tokens=320,
+            extra_instructions=None,  # 필요하면 "불릿 3개 이내" 등 추가
+        )
+
+        # 콘솔 출력(모델별 답변 + 출처)
+        for res in results:
+            print(f"\n=== [{res['model']}] ===")
+            print(res["answer"].strip())
+
+            # Sources 요약
+            if res.get("sources"):
+                print("\n[SOURCES]")
+                for i, s in enumerate(res["sources"], 1):
+                    title = s.get("title", "(제목 없음)")
+                    url = s.get("url", "")
+                    score = s.get("score")
+                    score_str = f" (score={round(float(score),4)})" if score is not None else ""
+                    print(f"{i}. {title} - {url}{score_str}")
+            else:
+                print("\n[SOURCES] (없음)")
+
+        # 필요 시 상위 레벨에서 활용할 수 있도록 반환
+        return results
+    
 def main():
     app = MainApp()
     # 워킹 스켈레톤: 전체 흐름 자리만 호출
