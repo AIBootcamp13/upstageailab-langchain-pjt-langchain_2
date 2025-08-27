@@ -23,7 +23,7 @@ from src.utils.config import AppConfig
 from src.retriever.search import Retriever
 from src.llm.solar import SolarClient
 from src.llm.prompt import PromptBuilder, PromptOptions
-
+import re
 
 class Answerer:
     def __init__(
@@ -91,6 +91,12 @@ class Answerer:
             "retrieval_ms": int((t1 - t0) * 1000),
             "used_top_k": len(sources),
         }
+    
+    @staticmethod
+    def _strip_model_sources(text: str) -> str:
+    # 하단의 "Sources:"나 "SOURCES" 이후를 전부 제거 (대소문자/개행 허용)
+        return re.sub(r"(?is)\n+sources?:\s*\n[\s\S]*$", "", text).strip()
+
 
     def _generate(
         self,
@@ -129,6 +135,7 @@ class Answerer:
                 model=model,
                 max_tokens=max_tokens,
             )
+            answer = self._strip_model_sources(answer) 
             t1 = time.time()
 
             # 4) 정상 결과 반환

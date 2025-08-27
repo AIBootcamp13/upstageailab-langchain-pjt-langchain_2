@@ -180,25 +180,6 @@ with col_right:
                 st.markdown("---")
                 st.markdown(r["answer"])
 
-                # Sources 섹션 (답변 본문과 별도로 다시 한번 명확히)
-                st.markdown("#### Sources")
-                if r.get("sources"):
-                    for idx, s in enumerate(r["sources"], 1):
-                        title = s.get("title", "(제목 없음)")
-                        url = s.get("url", "")
-                        score = s.get("score", None)
-                        meta_line = []
-                        if s.get("source"):
-                            meta_line.append(s["source"])
-                        if s.get("date_published"):
-                            meta_line.append(s["date_published"])
-                        meta_txt = " · ".join(meta_line)
-
-                        score_txt = f" · score={round(float(score), 4)}" if score is not None else ""
-                        st.markdown(f"- **[{idx}] {title}**  \n  {meta_txt}{score_txt}  \n  <{url}>")
-                else:
-                    st.info("선택된 근거가 없습니다.")
-
                 # Raw 디버깅 요약
                 if r.get("raw"):
                     st.caption(f"raw: {r['raw']}")
