@@ -50,7 +50,7 @@ with st.sidebar:
     use_mmr = st.checkbox("Use MMR", value=True)
 
     # 생성 길이
-    max_tokens = st.slider("Max tokens (generation)", 150, 800, 320, 50)
+    max_tokens = st.slider("Max tokens (generation)", 300, 1200, 700, 50)
 
     st.caption("※ Retrieval/Generation 파라미터 변경 후 아래 버튼으로 적용하세요.")
     if st.button("Apply Retrieval Settings", use_container_width=True):

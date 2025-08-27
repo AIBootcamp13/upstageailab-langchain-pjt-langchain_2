@@ -1,165 +1,243 @@
 # src/qa/answerer.py
 """
-이 파일의 목적:
-- 질문 한 번으로 '검색 → 프롬프트 조립 → LLM 생성'까지 수행하는 오케스트레이터.
-- 내부적으로 Retriever, PromptBuilder, SolarClient를 호출한다.
-- 결과는 '답변 텍스트 + Sources(출처)' 형태로 반환한다.
+Answerer
+--------
+Retriever → PromptBuilder → SolarClient 를 오케스트레이션하여
+질문에 대한 최종 답변을 생성하는 상위 레벨 유스케이스 레이어.
 
-사용 흐름(예):
-    from src.qa.answerer import Answerer
-    ans = answerer.answer("최근 OpenAI 관련 중요한 발표를 요약해줘")
-    print(ans["model"], ans["answer"])
-    for s in ans["sources"]: print(s["title"], s["url"])
+주요 동작
+---------
+1) _retrieve(): 사용자 질문 임베딩 → 벡터 검색(Top-k/MMR) → Evidence 목록 반환
+2) _generate(): PromptBuilder로 System/User 프롬프트 구성 → Solar로 생성 호출
+3) answer(), answer_multi(): 단일/다중 모델 실행
 
-또는 두 모델 비교:
-    answers = answerer.answer_multi("질문", models=["solar-pro","solar-mini"])
-    for a in answers: print(a["model"], a["answer"][:120])
+하위호환
+--------
+- PromptOptions는 style/include_sources를 받아도 동작(내부 매핑).
 """
 
-from __future__ import annotations
 from typing import List, Dict, Any, Optional
+import time
 
 from src.utils.config import AppConfig
-from src.llm.solar import SolarClient
 from src.retriever.search import Retriever
+from src.llm.solar import SolarClient
 from src.llm.prompt import PromptBuilder, PromptOptions
 
 
 class Answerer:
-    """
-    검색 → 프롬프트 → 생성까지 한 번에 수행하는 컨트롤러.
-    - init 시점에 필요한 의존성(설정/클라이언트)들을 준비한다.
-    - answer(): 단일 모델로 생성
-    - answer_multi(): 여러 모델(mini/pro) 비교 생성
-    """
     def __init__(
         self,
-        cfg: Optional[AppConfig] = None,
-        top_k: int = 5,
+        cfg: AppConfig,
+        top_k: int = 7,            # 길이/정보량 확보 위해 기본 7
         use_mmr: bool = True,
         mmr_lambda: float = 0.3,
         prompt_opt: Optional[PromptOptions] = None,
-        collection_name: str = "ai_news_rag",
-    ) -> None:
-        self.cfg = cfg or AppConfig()
+    ):
+        """
+        Parameters
+        ----------
+        cfg : AppConfig
+            경로/키/설정이 담긴 앱 설정 객체.
+        top_k : int
+            리트리버가 가져올 초기 후보 개수.
+        use_mmr : bool
+            MMR 사용 여부.
+        mmr_lambda : float
+            MMR 가중치(관련성↔다양성 균형).
+        prompt_opt : Optional[PromptOptions]
+            프롬프트 옵션(없으면 기본값 사용).
+        """
+        self.cfg = cfg
 
-        # LLM/Solar 클라이언트 (임베딩·생성 모두 사용)
-        self.solar = SolarClient(api_key=self.cfg.solar_api_key)
+        # 1) LLM 클라이언트 (임베딩/생성 공용)
+        self.solar = SolarClient(api_key=cfg.solar_api_key)
 
-        # 리트리버(Chroma 연결)
+        # 2) 리트리버 (❗ SolarClient를 반드시 넘겨야 함)
         self.retriever = Retriever(
-            chroma_dir=self.cfg.chroma_dir,
-            solar_client=self.solar,
-            collection_name=collection_name,
+            chroma_dir=cfg.chroma_dir,
+            solar_client=self.solar,   # ← 필수 인자
             top_k=top_k,
             use_mmr=use_mmr,
             mmr_lambda=mmr_lambda,
         )
 
-        # 프롬프트 옵션 (한국어·불릿·Sources 강제·CoT 조용히)
-        self.prompt_builder = PromptBuilder(
-            options=prompt_opt or PromptOptions(
-                language="ko",
-                style="bullets",
-                include_sources=True,
-                max_context_chars=3000,
-                max_blocks=5,
-                max_block_chars=800,
-                cot_silent=True,
-                react_hint=False,  # 필요시 True
-            )
-        )
+        # 3) 프롬프트 빌더
+        #    (PromptOptions는 style/include_sources 하위호환 지원: prompt.py 참조)
+        self.prompt_builder = PromptBuilder(options=prompt_opt or PromptOptions())
 
-    # ------------------- public API ------------------- #
+    # ---------------- internal helpers ---------------- #
+
+# src/qa/answerer.py  — Answerer 클래스 안의 이 함수만 교체
+
+    def _retrieve(self, question: str) -> Dict[str, Any]:
+        """
+        리트리버로 evidence(근거 청크) 리스트를 구한다. (리턴 타입 방어 포함)
+        """
+        t0 = time.time()
+        sources = self.retriever.search(question)
+        t1 = time.time()
+
+        # ⬇️ 방어: 리스트 보장
+        if sources is None:
+            sources = []
+        elif isinstance(sources, dict):
+            sources = list(sources.values())
+        elif not isinstance(sources, list):
+            sources = list(sources)
+
+        return {
+            "sources": sources,
+            "retrieval_ms": int((t1 - t0) * 1000),
+            "used_top_k": len(sources),
+        }
+
+    def _generate(
+        self,
+        question: str,
+        model: str,
+        max_tokens: int,
+        extra_instructions: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        하나의 모델로 QA 실행:
+        - 검색 (Retriever)
+        - 프롬프트 생성 (PromptBuilder)
+        - LLM 호출 (SolarClient)
+        - 결과 dict 반환 (항상 동일한 구조)
+
+        실패 시에도 dict로 error 메시지를 포함해 반환합니다.
+        """
+
+        try:
+            # 1) 검색
+            ret = self._retrieve(question)
+            evidences = self._normalize_evidences(ret["sources"])
+
+            # 2) 프롬프트 생성
+            system_prompt, user_prompt = self.prompt_builder.build_messages(
+                question=question,
+                evidences=evidences,
+                extra_instructions=extra_instructions,
+            )
+
+            # 3) LLM 호출
+            t0 = time.time()
+            answer = self.solar.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+                max_tokens=max_tokens,
+            )
+            t1 = time.time()
+
+            # 4) 정상 결과 반환
+            return {
+                "model": model,
+                "answer": answer,
+                "sources": evidences,
+                "used_top_k": len(evidences),
+                "retrieval_ms": ret.get("retrieval_ms", 0),
+                "gen_ms": int((t1 - t0) * 1000),
+                "error": None,
+            }
+
+        except Exception as e:
+            # ✅ 실패도 항상 dict로 반환 → UI가 깨지지 않음
+            return {
+                "model": model,
+                "answer": f"[ERROR] {e}",
+                "sources": [],
+                "used_top_k": 0,
+                "retrieval_ms": 0,
+                "gen_ms": 0,
+                "error": str(e),
+            }
+
+
+    # ---------------- public API ---------------- #
+
     def answer(
         self,
         question: str,
         model: str = "solar-pro",
-        max_tokens: int = 300,
+        max_tokens: int = 600,
         extra_instructions: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        단일 모델로 답변 생성.
-        반환: {
-          "model": str,
-          "answer": str,
-          "sources": List[Dict[str, Any]],  # title/url/score 등
-          "used_top_k": int,
-          "raw": Dict[str, Any]            # 디버깅 숫자(n_initial/selected 등)
-        }
-        """
-        # 1) 검색: Top-k 근거
-        ret = self.retriever.search(question)
-        sources = ret.get("sources", [])
+        """단일 모델로 QA 실행"""
+        return self._generate(question, model, max_tokens, extra_instructions)
 
-        # 2) 프롬프트 조립
-        msgs = self.prompt_builder.build_messages(
-            question=question,
-            sources=sources,
-            extra_instructions=extra_instructions,
-        )
-        system = msgs[0]["content"]
-        user = msgs[1]["content"]
-
-        # 3) LLM 생성 호출
-        try:
-            answer_text = self.solar.generate(
-                system_prompt=system,
-                user_prompt=user,
-                model=model,
-                max_tokens=max_tokens,
-            )
-        except Exception as e:
-            answer_text = f"(오류) 모델 호출 실패: {e}"
-
-        # 4) 결과 패키징
-        return {
-            "model": model,
-            "answer": answer_text,
-            "sources": sources,        # UI에서 카드로 표기 가능
-            "used_top_k": len(sources),
-            "raw": ret.get("raw", {}),
-        }
-
-    def answer_multi(
-        self,
-        question: str,
-        models: Optional[List[str]] = None,
-        max_tokens: int = 300,
-        extra_instructions: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        여러 모델을 같은 컨텍스트로 호출해 결과를 나란히 비교.
-        기본: ["solar-pro", "solar-mini"]
-        """
-        models = models or ["solar-pro", "solar-mini"]
-
-        # 한 번만 검색하고(같은 근거)
-        ret = self.retriever.search(question)
-        sources = ret.get("sources", [])
-        msgs = self.prompt_builder.build_messages(
-            question=question, sources=sources, extra_instructions=extra_instructions
-        )
-        system = msgs[0]["content"]
-        user = msgs[1]["content"]
-
+    def answer_multi(self, question: str, models: List[str], max_tokens: int = 600, extra_instructions: Optional[str] = None) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         for m in models:
-            try:
-                text = self.solar.generate(
-                    system_prompt=system,
-                    user_prompt=user,
-                    model=m,
-                    max_tokens=max_tokens,
-                )
-            except Exception as e:
-                text = f"(오류) 모델 호출 실패: {e}"
-
-            results.append({
-                "model": m,
-                "answer": text,
-                "sources": sources,
-                "used_top_k": len(sources),
-                "raw": ret.get("raw", {}),
-            })
+            out = self._generate(question, m, max_tokens, extra_instructions)
+            # ✅ None 방지: 항상 dict 이어야 함
+            if not isinstance(out, dict):
+                out = {"model": m, "answer": "[ERROR] Unknown failure", "sources": [], "used_top_k": 0, "retrieval_ms": 0, "gen_ms": 0, "error": "unknown"}
+            results.append(out)
         return results
+    
+    # src/qa/answerer.py — Answerer 클래스 내부에 추가
+
+    def _normalize_evidences(self, sources) -> list[dict]:
+        """
+        다양한 형태(set/tuple/str/dict 등)로 올 수 있는 sources를
+        프롬프트에서 기대하는 List[dict]로 강제 변환한다.
+        dict에는 최소 키(title/url/source/date_published/score/text)를 채운다.
+        """
+        # 컨테이너 보정
+        if sources is None:
+            items = []
+        elif isinstance(sources, dict):
+            items = list(sources.values())
+        elif isinstance(sources, list):
+            items = sources
+        else:
+            items = list(sources)
+
+        norm: list[dict] = []
+        for it in items:
+            if isinstance(it, dict):
+                norm.append({
+                    "title": it.get("title") or "(제목 없음)",
+                    "url": it.get("url") or "",
+                    "source": it.get("source") or "",
+                    "date_published": it.get("date_published") or "",
+                    "score": it.get("score", None),
+                    "text": (it.get("text") or "").strip(),
+                })
+            elif isinstance(it, str):
+                norm.append({
+                    "title": "(제목 없음)",
+                    "url": "",
+                    "source": "",
+                    "date_published": "",
+                    "score": None,
+                    "text": it.strip(),
+                })
+            elif isinstance(it, (tuple, list)) and len(it) == 2:
+                a, b = it
+                if isinstance(a, dict) and not isinstance(b, dict):
+                    meta, text = a, str(b)
+                elif isinstance(b, dict) and not isinstance(a, dict):
+                    meta, text = b, str(a)
+                else:
+                    meta, text = {}, " ".join(str(x) for x in it)
+                norm.append({
+                    "title": (meta.get("title") if isinstance(meta, dict) else None) or "(제목 없음)",
+                    "url": (meta.get("url") if isinstance(meta, dict) else "") or "",
+                    "source": (meta.get("source") if isinstance(meta, dict) else "") or "",
+                    "date_published": (meta.get("date_published") if isinstance(meta, dict) else "") or "",
+                    "score": (meta.get("score") if isinstance(meta, dict) else None),
+                    "text": text.strip(),
+                })
+            else:
+                norm.append({
+                    "title": "(제목 없음)",
+                    "url": "",
+                    "source": "",
+                    "date_published": "",
+                    "score": None,
+                    "text": str(it).strip(),
+                })
+        return norm
