@@ -1,4 +1,4 @@
-# 프로젝트 이름
+# AI 뉴스 RAG (LangChain + Upstage Solar + Chroma)
 
 <br>
 
